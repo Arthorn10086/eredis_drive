@@ -18,9 +18,10 @@ Erlang Redis 驱动
                 ]}}
         ]}
 ```
-mode:
-    cluster cluster集群模式
+mode:<br>
+    cluster cluster集群模式<br>
     single  单机模式
+---
 Build
 -----
 
