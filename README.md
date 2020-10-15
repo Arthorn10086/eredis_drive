@@ -2,7 +2,7 @@ eredis_drive
 =====
 
 Erlang Redis 驱动
-···
+```
 {env, [
             {mode, cluster},
             {pools, {
@@ -17,7 +17,7 @@ Erlang Redis 驱动
                     [{port, 6384}]
                 ]}}
         ]}
-···
+```
 mode:
     cluster cluster集群模式
     single  单机模式
