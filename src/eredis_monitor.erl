@@ -18,7 +18,7 @@
 -define(SERVER, ?MODULE).
 
 -record(state, {pool_args, work_args, cluster_nodes = [], slot_mapping, indexs = []}).
--record(cluster_node, {address, nodecfg, start_slot = 0, end_slot = 0, pool_index = 0, pool = none}).
+-record(cluster_node, {address, nodecfg, start_slot = -1, end_slot = 0, pool_index = 0, pool = none}).
 
 %%%===================================================================
 %%% API
@@ -93,7 +93,7 @@ code_change(_OldVsn, State, _Extra) ->
 parse_args([], R) ->
     lists:reverse(R);
 parse_args([NodeCfg | T], R) ->
-    Host = proplists:get_value(ip, NodeCfg, "127.0.0.1"),
+    Host = proplists:get_value(host, NodeCfg, "127.0.0.1"),
     Port = proplists:get_value(port, NodeCfg, 6379),
     R1 = [#cluster_node{address = {Host, Port}, nodecfg = NodeCfg} | R],
     parse_args(T, R1).
@@ -145,7 +145,7 @@ create_pool(State, ClusterNode, Index) ->
     {SSlot, ESlot, Ip, Port} = ClusterNode,
     Node = case lists:keyfind({Ip, Port}, 2, Nodes) of
         false ->
-            #cluster_node{address = {Ip, Port}, nodecfg = [{ip, Ip}, {port, Port}]};
+            #cluster_node{address = {Ip, Port}, nodecfg = [{host, Ip}, {port, Port}]};
         V ->
             V
     end,
@@ -167,7 +167,7 @@ create_slot_mapping(State1) ->
     Nodes = State1#state.cluster_nodes,
     lists:foreach(fun(Node) ->
         case Node#cluster_node.start_slot of
-            0 ->
+            -1 ->
                 ok;
             SSlot ->
                 ESlot = Node#cluster_node.end_slot,
