@@ -1,7 +1,7 @@
 eredis_drive
 =====
 
-An OTP application
+Erlang Redis 驱动
 
 Build
 -----
