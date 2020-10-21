@@ -5,7 +5,9 @@
 
 %% API
 -export([start_link/1]).
--export([reset_cluster_nodes/0, get_pool_by_slot/1]).
+-export([reset_cluster_nodes/1, get_pool_by_slot/1]).
+
+-export([monitor_refresh/1]).
 
 %% gen_server callbacks
 -export([init/1,
@@ -17,8 +19,8 @@
 
 -define(SERVER, ?MODULE).
 
--record(state, {pool_args, work_args, cluster_nodes = [], slot_mapping, indexs = []}).
--record(cluster_node, {address, nodecfg, start_slot = -1, end_slot = 0, pool_index = 0, pool = none}).
+-record(state, {pool_args, work_args, cluster_nodes = [], slot_mapping, indexs = [], alarm}).
+-record(cluster_node, {address, md5, master, start_slot = -1, end_slot = 0, pool_index = 0, pool = none}).
 
 %%%===================================================================
 %%% API
@@ -26,8 +28,8 @@
 start_link(Args) ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, Args, []).
 
-reset_cluster_nodes() ->
-    gen_server:call(?MODULE, {reload_cluster_nodes}, 10000).
+reset_cluster_nodes(NodesCfg) ->
+    gen_server:call(?MODULE, {reload_cluster_nodes, NodesCfg}, 10000).
 
 get_pool_by_slot(Slot) ->
     case ets:lookup('$eredis_slots_mapping', Slot) of
@@ -40,18 +42,18 @@ get_pool_by_slot(Slot) ->
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
-init({PoolArgs, WorkArgs, NodeCfgs}) ->
+init({PoolArgs, WorkArgs, NodeCfgs, AlarmMFA}) ->
     Nodes = parse_args(NodeCfgs, []),
-    Ets = ets:new('$eredis_slots_mapping', [named_table, set, protected, {read_concurrency, true}]),
-    ClusterNodes = load_cluster(WorkArgs, Nodes),
-    State = #state{pool_args = PoolArgs, work_args = WorkArgs, cluster_nodes = Nodes, slot_mapping = Ets},
+    Ets = ets:new('$eredis_slots_mapping', [named_table, set, public, {read_concurrency, true}]),
+    ClusterNodes = load_cluster(WorkArgs, Nodes, AlarmMFA),
+    State = #state{pool_args = PoolArgs, work_args = WorkArgs, cluster_nodes = ClusterNodes, slot_mapping = Ets, alarm = AlarmMFA},
     State1 = create_all_pools(State, ClusterNodes, 1),
     create_slot_mapping(State1),
     erlang:send_after(10000, self(), 'monitor_refresh'),
     {ok, State1}.
 
-handle_call({reload_cluster_nodes}, _From, State) ->
-    Nodes = State#state.cluster_nodes,
+handle_call({reload_cluster_nodes, NodesCfg}, _From, State) ->
+    Nodes = parse_args(NodesCfg, []),
     Nodes1 = lists:map(fun(Node) ->
         case Node#cluster_node.pool of
             none ->
@@ -61,13 +63,10 @@ handle_call({reload_cluster_nodes}, _From, State) ->
                 Node#cluster_node{pool = none, pool_index = 0, start_slot = 0, end_slot = 0}
         end
     end, Nodes),
-    ClusterNodes = load_cluster(State#state.work_args, Nodes),
+    ClusterNodes = load_cluster(State#state.work_args, Nodes, State#state.alarm),
     State1 = create_all_pools(State#state{cluster_nodes = Nodes1, indexs = []}, ClusterNodes, 1),
     create_slot_mapping(State1),
     {reply, ok, State1};
-handle_call(monitor_refresh, _From, State) ->
-%%    State1 = monitor_refresh(State),
-    {reply, ok, State};
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
@@ -75,7 +74,10 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Request, State) ->
     {noreply, State}.
 
-
+handle_info(monitor_refresh, State) ->
+    State1 = monitor_refresh(State),
+    erlang:send_after(10000, self(), 'monitor_refresh'),
+    {noreply, State1};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -95,7 +97,7 @@ parse_args([], R) ->
 parse_args([NodeCfg | T], R) ->
     Host = proplists:get_value(host, NodeCfg, "127.0.0.1"),
     Port = proplists:get_value(port, NodeCfg, 6379),
-    R1 = [#cluster_node{address = {Host, Port}, nodecfg = NodeCfg} | R],
+    R1 = [#cluster_node{address = {Host, Port}} | R],
     parse_args(T, R1).
 
 
@@ -104,31 +106,52 @@ parse_args([NodeCfg | T], R) ->
 %%       加载集群信息
 %% @end
 %% ----------------------------------------------------
-load_cluster(_, []) ->
+load_cluster(_, [], _AlarmMFA) ->
     throw({?MODULE, ?FUNCTION_NAME});
-load_cluster(WorkerArgs, [ClusterNode | T]) ->
+load_cluster(WorkerArgs, [ClusterNode | T], AlarmMFA) ->
     {Host, Port} = ClusterNode#cluster_node.address,
-    Database = proplists:get_value(database, WorkerArgs, 0),
-    Password = proplists:get_value(password, WorkerArgs, ""),
-    case eredis:start_link(Host, Port, Database, Password) of
+    case eredis:start_link([{host, Host}, {port, Port} | WorkerArgs]) of
         {ok, Pid} ->
-            case eredis:q(Pid, ["CLUSTER", "SLOTS"]) of
+            case eredis:q(Pid, ["CLUSTER", "INFO"]) of
                 {ok, ClusterInfo} ->
-                    eredis:stop(Pid),
-                    parse_cluster_info(ClusterInfo);
+                    case hd(binary:split(ClusterInfo, <<"\r\n">>, [global])) of
+                        <<"cluster_state:ok">> ->
+                            case eredis:q(Pid, ["CLUSTER", "SLOTS"]) of
+                                {ok, ClusterSlots} ->
+                                    eredis:stop(Pid),
+                                    parse_cluster_slot(ClusterSlots);
+                                _ ->
+                                    eredis:stop(Pid),
+                                    load_cluster(WorkerArgs, T, AlarmMFA)
+                            end;
+                        _ ->
+                            %%监控报警
+                            case AlarmMFA of
+                                {M, F, A} ->
+                                    spawn(fun() -> M:F(A, ClusterInfo) end);
+                                _->
+                                    ok
+                            end,
+                            lager:log(error, self(), ClusterInfo),
+                            throw({?MODULE, cluster_state_fail})
+                    end;
                 _ ->
                     eredis:stop(Pid),
-                    load_cluster(WorkerArgs, T)
+                    load_cluster(WorkerArgs, T, AlarmMFA)
             end;
         _ ->
-            load_cluster(WorkerArgs, T)
+            load_cluster(WorkerArgs, T, AlarmMFA)
     end.
 
 
-parse_cluster_info(ClusterInfo) ->
-    lists:map(fun([SSlot, ESlot, [Address, Port | _] | _]) ->
-        {binary_to_integer(SSlot), binary_to_integer(ESlot), binary_to_list(Address), binary_to_integer(Port)}
-    end, ClusterInfo).
+parse_cluster_slot(ClusterSlots) ->
+    lists:foldl(fun([SSlot1, ESlot1, [Host, Port, NodeMd5] | SlaveInfos], R) ->
+        SSlot = binary_to_integer(SSlot1),
+        ESlot = binary_to_integer(ESlot1),
+        Master = #cluster_node{address = {binary_to_list(Host), binary_to_integer(Port)}, md5 = binary_to_list(NodeMd5), master = oneself, start_slot = SSlot, end_slot = ESlot},
+        Slaves = [#cluster_node{address = {binary_to_list(SHost), binary_to_integer(SPort)}, md5 = binary_to_list(SNodeMd5), master = binary_to_list(NodeMd5), start_slot = SSlot, end_slot = ESlot} || [SHost, SPort, SNodeMd5] <- SlaveInfos],
+        [Master | Slaves] ++ R
+    end, [], ClusterSlots).
 %% ----------------------------------------------------
 %% @doc
 %%        生成集群连接池
@@ -137,24 +160,22 @@ parse_cluster_info(ClusterInfo) ->
 create_all_pools(State, [], _) ->
     State;
 create_all_pools(State, [ClusterNode | T], Index) ->
-    State1 = create_pool(State, ClusterNode, Index),
+    State1 = case ClusterNode#cluster_node.master of
+        'oneself' ->
+            create_pool(State, ClusterNode, Index);
+        _ ->
+            State
+    end,
     create_all_pools(State1, T, Index + 1).
 
 create_pool(State, ClusterNode, Index) ->
     #state{cluster_nodes = Nodes, indexs = Indexs, pool_args = PoolArgs, work_args = WorkArgs} = State,
-    {SSlot, ESlot, Ip, Port} = ClusterNode,
-    Node = case lists:keyfind({Ip, Port}, 2, Nodes) of
-        false ->
-            #cluster_node{address = {Ip, Port}, nodecfg = [{host, Ip}, {port, Port}]};
-        V ->
-            V
-    end,
     PoolName = eredis_pool:get_pool_name(Index),
-    NodeCfg = Node#cluster_node.nodecfg,
-    ChildSpec = poolboy:child_spec(PoolName, [{name, {local, PoolName}} | PoolArgs], NodeCfg ++ WorkArgs),
+    {Ip, Port} = ClusterNode#cluster_node.address,
+    ChildSpec = poolboy:child_spec(PoolName, [{name, {local, PoolName}} | PoolArgs], [{host, Ip}, {port, Port}] ++ WorkArgs),
     {ok, _Child} = eredis_pool:start_child(ChildSpec),
-    Node1 = Node#cluster_node{pool_index = Index, pool = PoolName, start_slot = SSlot, end_slot = ESlot},
-    Nodes1 = lists:keyreplace({Ip, Port}, 2, Nodes, Node1),
+    Node1 = ClusterNode#cluster_node{pool_index = Index, pool = PoolName},
+    Nodes1 = lists:keyreplace({Ip, Port}, #cluster_node.address, Nodes, Node1),
     State#state{cluster_nodes = Nodes1, indexs = [Index | Indexs]}.
 
 %% ----------------------------------------------------
@@ -177,3 +198,38 @@ create_slot_mapping(State1) ->
         end
     end, Nodes),
     State1.
+
+
+monitor_refresh(State) ->
+    Nodes = State#state.cluster_nodes,
+    ClusterNodes = load_cluster(State#state.work_args, Nodes, State#state.alarm),
+    ets:insert(State#state.slot_mapping, [{new_node, ClusterNodes}, {old_node, Nodes}]),
+
+    {RemoveNodes, AddNodes} = lists:foldl(fun(Node, {ReMove, Add}) ->
+        case lists:member(Node#cluster_node{pool = none, pool_index = 0}, Add) of
+            true ->
+                {ReMove, lists:keydelete(Node#cluster_node.address, #cluster_node.address, Add)};
+            false ->
+                {[Node | ReMove], Add}
+        end
+    end, {[], ClusterNodes}, Nodes),
+    ets:insert(State#state.slot_mapping, [{rnode, RemoveNodes}, {anode, AddNodes}]),
+    Nodes1 = lists:foldl(fun(Node, R) ->
+        case Node#cluster_node.pool of
+            none ->
+                ok;
+            PoolName ->
+                eredis_pool:delete_child(PoolName)
+        end,
+        lists:keydelete(Node#cluster_node.address, #cluster_node.address, R)
+    end, Nodes, RemoveNodes),
+    ets:insert(State#state.slot_mapping, [{node1, Nodes1}]),
+    Indexs = State#state.indexs,
+    AddNum = length(AddNodes),
+    AddIndexs = lists:sublist(lists:seq(1, length(Indexs) + AddNum)--Indexs, AddNum),
+    State1 = lists:foldl(fun({I, N}, S) ->
+        create_pool(S, N, I)
+    end, State#state{cluster_nodes = Nodes1}, lists:zip(AddIndexs, AddNodes)),
+    NIndex2 = [N#cluster_node.pool_index || N <- State1#state.cluster_nodes, N#cluster_node.pool_index =/= 0],
+    State2 = State1#state{indexs = NIndex2},
+    create_slot_mapping(State2).
