@@ -5,7 +5,7 @@
 
 %% API
 -export([start_link/1]).
--export([reset_cluster_nodes/1, get_pool_by_slot/1]).
+-export([reset_cluster_nodes/1, get_pool_by_slot/1,get_pool_by_ipport/2]).
 
 -export([monitor_refresh/1]).
 
@@ -39,6 +39,9 @@ get_pool_by_slot(Slot) ->
             PoolName
     end.
 
+get_pool_by_ipport(Ip, Port) ->
+    gen_server:call(?MODULE, {get_pool_by_ipport, {Ip, Port}}, 5000).
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
@@ -49,7 +52,7 @@ init({PoolArgs, WorkArgs, NodeCfgs, AlarmMFA}) ->
     State = #state{pool_args = PoolArgs, work_args = WorkArgs, cluster_nodes = ClusterNodes, slot_mapping = Ets, alarm = AlarmMFA},
     State1 = create_all_pools(State, ClusterNodes, 1),
     create_slot_mapping(State1),
-    erlang:send_after(10000, self(), 'monitor_refresh'),
+    erlang:send_after(1000, self(), 'monitor_refresh'),
     {ok, State1}.
 
 handle_call({reload_cluster_nodes, NodesCfg}, _From, State) ->
@@ -67,6 +70,9 @@ handle_call({reload_cluster_nodes, NodesCfg}, _From, State) ->
     State1 = create_all_pools(State#state{cluster_nodes = Nodes1, indexs = []}, ClusterNodes, 1),
     create_slot_mapping(State1),
     {reply, ok, State1};
+handle_call({get_pool_by_ipport, {Ip, Port}}, _From, #state{cluster_nodes = ClusterNode} = State) ->
+    Node = lists:keyfind({Ip, Port}, #cluster_node.address, ClusterNode),
+    {reply, Node#cluster_node.pool, State};
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
@@ -76,7 +82,7 @@ handle_cast(_Request, State) ->
 
 handle_info(monitor_refresh, State) ->
     State1 = monitor_refresh(State),
-    erlang:send_after(10000, self(), 'monitor_refresh'),
+    erlang:send_after(1000, self(), 'monitor_refresh'),
     {noreply, State1};
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -129,7 +135,7 @@ load_cluster(WorkerArgs, [ClusterNode | T], AlarmMFA) ->
                             case AlarmMFA of
                                 {M, F, A} ->
                                     spawn(fun() -> M:F(A, ClusterInfo) end);
-                                _->
+                                _ ->
                                     ok
                             end,
                             lager:log(error, self(), ClusterInfo),
@@ -187,14 +193,15 @@ create_slot_mapping(State1) ->
     Mapping = State1#state.slot_mapping,
     Nodes = State1#state.cluster_nodes,
     lists:foreach(fun(Node) ->
-        case Node#cluster_node.start_slot of
-            -1 ->
-                ok;
-            SSlot ->
+        case Node#cluster_node.master of
+            'oneself' ->
+                SSlot = Node#cluster_node.start_slot,
                 ESlot = Node#cluster_node.end_slot,
                 PoolName = Node#cluster_node.pool,
                 Maps = [{Slot, PoolName} || Slot <- lists:seq(SSlot, ESlot)],
-                ets:insert(Mapping, Maps)
+                ets:insert(Mapping, Maps);
+            _ ->
+                ok
         end
     end, Nodes),
     State1.

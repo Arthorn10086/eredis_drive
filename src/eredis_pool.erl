@@ -41,7 +41,12 @@ get_pool(Key) ->
 %% @end
 %%--------------------------------------------------------------------
 get_pool_name(Index) ->
-    list_to_atom("eredis_pool" ++ integer_to_list(Index)).
+    try
+        list_to_existing_atom("eredis_pool" ++ integer_to_list(Index))
+    catch
+        _:_ ->
+            list_to_atom("eredis_pool" ++ integer_to_list(Index))
+    end.
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -65,7 +70,20 @@ q(PoolName, Command, Timeout) ->
     poolboy:transaction(PoolName, fun(Worker) ->
         case gen_server:call(Worker, worker) of
             {ok, Pid} ->
-                eredis:q(Pid, Command, Timeout);
+                case eredis:q(Pid, Command, Timeout) of
+                    {ok, Info} ->
+                        Info;
+                    {error, Error} ->
+                        case catch binary:split(Error, <<" ">>, [global]) of
+                            [<<"MOVED">>, _Slot, IPPORT] ->
+                                [IP1, Port1] = binary:split(IPPORT, <<":">>),
+                                %%TODO 维护一次slot映射表?
+                                q(eredis_monitor:get_pool_by_ipport(binary_to_list(IP1), binary_to_integer(Port1)), Command, Timeout);
+                            _ ->%%TODO ASK 指令
+                                {error, Error}
+                        end
+
+                end;
             Error ->
                 Error
         end
@@ -86,7 +104,7 @@ q_async(PoolName, Command) ->
     end).
 %%--------------------------------------------------------------------
 %% @doc
-%%  Pipeline模式
+%%  Pipeline模式 目前只支持单节点
 %% @end
 %%--------------------------------------------------------------------
 qp(PoolName, Pipeline) ->
