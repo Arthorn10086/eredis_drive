@@ -1,7 +1,8 @@
-eredis_drive
-=====
+## eredis_drive
 
-Erlang Redis 驱动
+
+Erlang Redis 驱动</br>
+配置
 ```
 {env, [
             {mode, cluster},
@@ -18,13 +19,14 @@ Erlang Redis 驱动
                 ]}}
         ]}
 ```
-参数：
-===
-mode<br>
-&emsp;&emsp; cluster cluster集群模式<br>
-&emsp;&emsp; single  单机模式
----
-Build
+### 参数
+mode 工作模式</br>
+&emsp;&emsp; cluster cluster集群模式</br>
+&emsp;&emsp; single  单机模式</br>
+pools  
+&emsp;&emsp;poolboy配置</br>
+
+### Build
 -----
 
     $ rebar3 compile
