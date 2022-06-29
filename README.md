@@ -20,11 +20,11 @@ Erlang Redis 驱动</br>
         ]}
 ```
 ### 参数
-mode 工作模式</br>
-&emsp;&emsp; cluster cluster集群模式</br>
-&emsp;&emsp; single  单机模式</br>
-pools  
-&emsp;&emsp;poolboy配置</br>
+mode 工作模式 
+* cluster cluster集群模式
+* single  单机模式
+* single_balance  
+
 
 ### Build
 -----

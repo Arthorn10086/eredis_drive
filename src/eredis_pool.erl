@@ -7,7 +7,7 @@
 -export([start_single/1, start_cluster/0, start_balance/1]).
 -export([start_link/1]).
 -export([get_pool_name/1, start_child/1, delete_child/1]).
--export([get_pool/1]).
+-export([get_pool/1, get_mode_info/0]).
 -export([q/2, q/3, q_async/2, qp/2, qp/3]).
 
 %% Supervisor callbacks
@@ -41,12 +41,7 @@ get_pool(Key) ->
 %% @end
 %%--------------------------------------------------------------------
 get_pool_name(Index) ->
-    try
-        list_to_existing_atom("eredis_pool" ++ integer_to_list(Index))
-    catch
-        _:_ ->
-            list_to_atom("eredis_pool" ++ integer_to_list(Index))
-    end.
+    list_to_atom("eredis_pool" ++ integer_to_list(Index)).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -74,15 +69,13 @@ q(PoolName, Command, Timeout) ->
                     {ok, Info} ->
                         Info;
                     {error, Error} ->
-                        case catch binary:split(Error, <<" ">>, [global]) of
-                            [<<"MOVED">>, _Slot, IPPORT] ->
+                        case catch binary:split(Error, <<" ">>) of
+                            [<<"MOVED">>, _Slot, IPPORT] ->%%集群发生变动，客户端slots映射还未维护
                                 [IP1, Port1] = binary:split(IPPORT, <<":">>),
-                                %%TODO 维护一次slot映射表?
                                 q(eredis_monitor:get_pool_by_ipport(binary_to_list(IP1), binary_to_integer(Port1)), Command, Timeout);
                             _ ->%%TODO ASK 指令
                                 {error, Error}
                         end
-
                 end;
             Error ->
                 Error

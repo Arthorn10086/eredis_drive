@@ -5,7 +5,7 @@
 -author("arthorn").
 %%%=======================EXPORT=======================
 -export([slot/1]).
-
+-export([load/0,slot_nif/1]).
 %%%=======================INCLUDE======================
 
 %%%=======================DEFINE======================
@@ -50,6 +50,10 @@
 %% ----------------------------------------------------
 slot(Key)->
     crc16(Key) rem ?REDIS_CLUSTER_HASH_SLOTS.
+load() ->
+    erlang:load_nif("E:/rust/erl_lib/target/release/erl_lib", 0).
+slot_nif(_Key)->
+    erlang:nif_error("NIF Library not loaded").
 
 %% ----------------------------------------------------
 %% @doc

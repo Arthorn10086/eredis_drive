@@ -28,11 +28,12 @@ start_link(Args) ->
 %%% gen_server callbacks
 %%%===================================================================
 init(Args) ->
+    process_flag(trap_exit, true),
     {ok, Conn} = eredis:start_link(Args),
     {ok, #state{conn = Conn}}.
 
 handle_call('worker', _From, State) ->
-    {reply, State#state.conn, State};
+    {reply, {ok, State#state.conn}, State};
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
@@ -40,7 +41,8 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Request, State) ->
     {noreply, State}.
 
-
+handle_info({'EXIT', _, _} = Err,  State) ->
+    {noreply, State};
 handle_info(_Info, State) ->
     {noreply, State}.
 

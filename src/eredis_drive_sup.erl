@@ -36,12 +36,13 @@ start_link() ->
 init([]) ->
     {ok, Pools} = application:get_env(eredis_drive, pools),
     {ok, Mode} = application:get_env(eredis_drive, mode),
+    {ok, DockerMapping} = application:get_env(eredis_drive, docker_mapping),
     ets:new(?MODULE, [named_table, set, public, {read_concurrency, true}]),
     StartSpec = case Mode of
         ?CLUSTER ->
             Pool = {eredis_pool, {eredis_pool, start_cluster, []},
                 permanent, 5000, worker, [eredis_pool]},
-            Monitor = {eredis_monitor, {eredis_monitor, start_link, [Pools]},
+            Monitor = {eredis_monitor, {eredis_monitor, start_link, [{Pools, DockerMapping}]},
                 permanent, 5000, worker, [eredis_monitor]},
             [Pool, Monitor];
         ?SINGLE_BALANCE ->
