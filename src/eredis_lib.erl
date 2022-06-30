@@ -3,23 +3,26 @@
 %%%=======================STATEMENT====================
 -description("eredis_lib").
 -author("arthorn").
--vsn(1.0).
 
 %%%=======================EXPORT=======================
 -export([sync_command/3, sync_command/4, async_command/3]).
 -export([lock/1, lock/2, lock/3, lock/4, unlock/1]).
--export([getv/2, getv/1, gets/2, gets1/2]).
+-export([getv/2, getv/1, gets/1, mget/2]).
 -export([delete/2, delete/1, delete1/1]).
 -export([dirty_write/2, dirty_write/3, dirty_write/4]).
--export([update/5, update/6]).
+-export([update/3, update/5, update/6]).
+-export([transaction/4]).
 -export([redis_str_key/1, redis_str_key/2]).
 -export([redis_lock_key/1, redis_lock_key/2]).
+-export([term_to_list/1]).
 %%%=======================INCLUDE======================
 
 %%%=======================DEFINE======================
 -define(TIMEOUT, 5000).
 -define(LOCKTIME, 5).
--define(LOCK_SLEEP_TIME,50).
+-define(LOCK_SLEEP_TIME, 50).
+-define(DEF_VALUE, none).
+-define(IGNORE_VALUE, '$ignore').
 %%%=======================RECORD=======================
 
 %%%=======================TYPE=========================
@@ -46,8 +49,11 @@ async_command(PoolName, Order, Params) ->
 %% ----------------------------------------------------
 %% @doc
 %%       获取 str类型的值
+%%       Table 是逻辑表   key是键值   在redis中  组装成  "Table:Key"
 %% @end
 %% ----------------------------------------------------
+getv({Table, Key}) ->
+    getv(redis_str_key(Table, Key), 'none');
 getv(TableKey) ->
     getv(TableKey, 'none').
 getv(TableKey, Def) ->
@@ -71,35 +77,53 @@ delete1(TableKey) ->
     R.
 %% ----------------------------------------------------
 %% @doc
-%%       获取 str类型的值  MGET目前不支持集群
+%%       获取 str类型的值
 %% @end
 %% ----------------------------------------------------
-gets(Pool, TableKeyDefs) ->
-    {TableKeys, Defs} =
-        lists:foldl(fun({T, K}, {R1, R2}) ->
-            {[{T, K} | R1], ['ignore' | R2]};
-            ({T, K, D}, {R1, R2}) ->
-                {[{T, K} | R1], [D | R2]}
-        end, {[], []}, TableKeyDefs),
-    Values = gets1(Pool, redis_str_key(TableKeys)),
-    lists:map(fun({V, DV}) ->
-        if
-            DV =:= 'ignore' ->
-                V;
-            V =:= undefined ->
-                DV;
-            true ->
-                V
+gets(TableKeyDefs) ->
+    %%获取keys slot映射关系，遍历出所有节点
+    {_, NodeKeys} = lists:foldl(fun({T, K, D}, {I, R1}) ->
+        TK = redis_str_key(T, K),
+        Pool = eredis_pool:get_pool(TK),
+        case lists:keytake(Pool, 1, R1) of
+            {value, {_, L1, L2}, R11} ->
+                {I + 1, [{Pool, [TK | L1], [{I, D} | L2]} | R11]};
+            _ ->
+                {I + 1, [{Pool, [TK], [{I, D}]} | R1]}
         end
-    end, lists:zip(Values, Defs)).
+    end, {1, []}, TableKeyDefs),
+    %%遍历所有节点，依次get
+    Reults = lists:foldl(fun({Pool, Keys, IndexDefs}, Acc) ->
+         VL = mget(Pool, Keys),
+        merge_index_value_def(VL, IndexDefs, []) ++ Acc
+    end, [], NodeKeys),
+    %%聚合结果，调整顺序，保证和入参一致
+    [V || {_, V} <- lists:keysort(1, Reults)].
 
-gets1(Pool, TableKeys) ->
-    element(2, sync_command(Pool, "MGET", TableKeys)).
+
 %% ----------------------------------------------------
 %% @doc
-%%       脏写
+%%      cluster不支持mget， 直接循环get
+%%      TODO pipeline
 %% @end
 %% ----------------------------------------------------
+mget(Pool, TableKeys) ->
+    lists:map(fun(TK)->
+        case sync_command(Pool, "GET", [TK]) of
+            {error, Err} ->
+                throw(Err);
+            {ok, B} ->
+                B
+        end
+    end,TableKeys).
+%% ----------------------------------------------------
+%% @doc
+%%       脏写 str类型
+%% @end
+%% ----------------------------------------------------
+dirty_write({T, K}, Value) ->
+    TableKey = redis_str_key(T, K),
+    sync_command(eredis_pool:get_pool(TableKey), "SET", [TableKey, Value]);
 dirty_write(TableKey, Value) ->
     sync_command(eredis_pool:get_pool(TableKey), "SET", [TableKey, Value]).
 dirty_write(TableKey, Value, EX) when is_integer(EX) ->
@@ -123,6 +147,7 @@ dirty_write(TableKey, Value, NX, EX) ->
 %% @doc
 %%       锁  LockTime:锁超时时间  TimeOut:客户端等待超时时间
 %%      set nx实现竞争锁  ex超时时间防止死锁  对象存储为进程id 实现持锁人解锁
+%%      自旋锁，每隔50毫秒重试一次
 %% @end
 %% ----------------------------------------------------
 lock(Table, Key) ->
@@ -135,7 +160,7 @@ lock(LockKey) ->
     lock(LockKey, ?LOCKTIME, ?TIMEOUT).
 lock(LockKey, LockTime, TimeOut) ->
     lock_(LockKey, pid_to_list(self()), LockTime, TimeOut).
-%%自旋锁
+
 lock_(SLKey, V, _LockTime, TimeOut) when TimeOut =< 0 ->
     throw({lock_error, SLKey, V});
 lock_(SLKey, V, LockTime, TimeOut) ->
@@ -152,53 +177,29 @@ lock_(SLKey, V, LockTime, TimeOut) ->
 %% @doc
 %%       解除锁
 %% ①检查是否是自己持有锁  ②删除锁
-%% 解锁分为两步，但是要保证操作的原子性
+%% 解锁分为两步，但是要保证操作的原子性使用lua
+%%  eval script numkeys keys args
 %% @end
 %% ----------------------------------------------------
 unlock(LockKey) ->
+    LuaScript = "if redis.call('get',KEYS[1]) == ARGV[1] then return redis.call('del',KEYS[1]) else return 0 end",
     V = list_to_binary(pid_to_list(self())),
     Pool = eredis_pool:get_pool(LockKey),
-    sync_command(Pool, "WATCH", [LockKey]),
-    {ok, V1} = sync_command(Pool, "GET", [LockKey]),
-    sync_command(Pool, "MULTL", []),
-    case V =:= V1 of
-        true ->%%只能删除自己的锁
-            sync_command(Pool, "DEL", [LockKey]);
-        false ->
-            ok
+    case eredis_lib:sync_command(Pool, "EVAL", [LuaScript, 1, LockKey, V]) of
+        {ok, _} ->
+            ok;
+        {error, Err} ->
+            lager:error("unlock err:~p reason:~p", [LockKey, Err])
     end,
-    sync_command(Pool, "EXEC", []),
-%%    sync_command(Pool, "UNWATCH", []),
     ok.
-%%%% ----------------------------------------------------
-%%%% @doc
-%%%%       解除锁
-%%%% @end
-%%%% ----------------------------------------------------
-%%unlocks([{_Table, _Key} | _T] = TableKeys) ->
-%%    LockKeys = redis_lock_key(TableKeys),
-%%    unlock(LockKeys);
-%%unlocks(LockKeys) ->
-%%    V = list_to_binary(pid_to_list(self())),
-%%    sync_command("WATCH", LockKeys),
-%%    {ok, VL} = sync_command("MGET", LockKeys),
-%%    sync_command("MULTL", []),
-%%    lists:foreach(fun({LockKey, V1}) ->
-%%        case V =:= V1 of
-%%            true ->%%只能删除自己的锁
-%%                sync_command("DEL", [LockKey]);
-%%            false ->
-%%                ok
-%%        end
-%%    end, lists:zip(LockKeys, VL)),
-%%    sync_command("EXEC", []),
-%%    sync_command("UNWATCH", []),
-%%    ok.
+
 %% ----------------------------------------------------
 %% @doc
 %%       锁修改
 %% @end
 %% ----------------------------------------------------
+update(Table, Key, V) ->
+    update(Table, Key, fun(_, _) -> {ok, ok, V} end, none, []).
 update(Table, Key, Fun, Def, Args) ->
     update(Table, Key, Fun, Def, Args, ?TIMEOUT).
 update(Table, Key, Fun, Def, Args, TimeOut) ->
@@ -206,46 +207,56 @@ update(Table, Key, Fun, Def, Args, TimeOut) ->
     lock(LockKey, ?LOCKTIME, TimeOut),
     TableKey = redis_str_key(Table, Key),
     OldV = getv(TableKey, Def),
-    try
-        case Fun(Args, OldV) of
-            {ok, Reply} ->
-                Reply;
-            {ok, Reply, OldV} ->
-                Reply;
-            {ok, Reply, NV} ->
-                dirty_write(TableKey, NV),
-                Reply;
-            Other ->
-                throw({?MODULE, ?FUNCTION_NAME, 'bad_return', Other})
-        end
+    try Fun(Args, OldV) of
+        {ok, Reply} ->
+            Reply;
+        {ok, Reply, OldV} ->
+            Reply;
+        {ok, Reply, NV} ->
+            dirty_write(TableKey, NV),
+            Reply;
+        Other ->
+            throw({?MODULE, ?FUNCTION_NAME, 'bad_return', Other})
     catch
+        throw:R ->
+            R;
         _EType:Reason ->
-            Reason
+            throw({update_error, Table, Key, Def, Args, Reason})
     after
-        unlock([LockKey])
+        unlock(LockKey)
     end.
 %% ----------------------------------------------------
 %% @doc
-%%       事务
+%%       伪事务 TCC
 %% @end
 %% ----------------------------------------------------
-%%transaction(TableKeyDefs, F, Args, TimeOut) ->
-%%    TableKeys = [redis_lock_key(T, K) || {T, K, _D} <- TableKeyDefs],
-%%    LockKeys = transaction_locks(TableKeys, TimeOut, term_to_string(self())),
-%%    Values = gets(TableKeyDefs),
-%%    Reply1 = case catch F(Args, Values) of
-%%        {ok, Reply} ->
-%%            Reply;
-%%        {ok, Reply, Values} ->
-%%            Reply;
-%%        {ok, Reply, NValues} ->
-%%            transaction_after_update(TableKeyDefs, NValues),
-%%            Reply;
-%%        Err ->
-%%            Err
-%%    end,
-%%    unlock(LockKeys),
-%%    Reply1.
+transaction(TableKeyDefs, F, Args, TimeOut) ->
+    TableKeys = [redis_lock_key(T, K) || {T, K, _D} <- TableKeyDefs],
+    %%  锁住
+    LockKeys = transaction_locks(TableKeys, TimeOut, pid_to_list(self())),
+    Values = gets(TableKeyDefs),
+    %%  逻辑处理
+    try F(Args, Values) of
+        {ok, Reply} ->
+            unlocks(LockKeys),
+            Reply;
+        {ok, Reply, Values} ->
+            unlocks(LockKeys),
+            Reply;
+        {ok, Reply, NValues} ->
+            %%  Confirm
+            confirm(TableKeyDefs, Values, NValues),
+            unlocks(LockKeys),
+            Reply;
+        Err ->
+            unlocks(LockKeys),
+            Err
+    catch
+        E1:E2 ->
+            lager:error("transaction_error,type:~p,reason:~p,info:~p", [E1, E2, erlang:get_stacktrace()]),
+            %%  Cancel
+            unlocks(LockKeys)
+    end.
 
 %% ----------------------------------------------------
 %% @doc
@@ -255,7 +266,7 @@ update(Table, Key, Fun, Def, Args, TimeOut) ->
 redis_str_key(TableKeys) when is_list(TableKeys) ->
     [redis_str_key(Table, Key) || {Table, Key} <- TableKeys].
 redis_str_key(Table, Key) ->
-    atom_to_list(Table) ++ ":" ++ atom_to_list(Key).
+    atom_to_list(Table) ++ ":" ++ term_to_list(Key).
 %% ----------------------------------------------------
 %% @doc
 %%      获得redis锁key
@@ -264,51 +275,106 @@ redis_str_key(Table, Key) ->
 redis_lock_key(TableKeys) ->
     [redis_lock_key(Table, Key) || {Table, Key} <- TableKeys].
 redis_lock_key(Table, Key) ->
-    "lock:" ++ atom_to_list(Table) ++ ":" ++ atom_to_list(Key).
+    "lock:" ++ atom_to_list(Table) ++ ":" ++ term_to_list(Key).
 %%%===================LOCAL FUNCTIONS==================
-%%%% ----------------------------------------------------
-%%%% @doc
-%%%%      transaction批量锁
-%%%% @end
-%%%% ----------------------------------------------------
-%%transaction_locks(TableKeys, TimeOut, V) ->
-%%    MS1 = now_millisecond(),
-%%    {Suc, Fail} = lists:foldl(fun(LockKey, {S, F}) ->
-%%        case sync_command("SET", [LockKey, V, "EX", ?LOCKTIME, "NX"]) of
-%%            {ok, <<"OK">>} ->
-%%                {[LockKey | S], F};
-%%            _ ->
-%%                {S, [LockKey | F]}
-%%        end
-%%    end, {[], []}, TableKeys),
-%%    case Fail =:= [] of
-%%        true ->
-%%            Suc;
-%%        false ->
-%%            unlock(Suc),
-%%            MS2 = now_millisecond(),
-%%            transaction_locks(TableKeys, TimeOut - (MS2 - MS1), V)
-%%    end.
-%%%% ----------------------------------------------------
-%%%% @doc
-%%%%      transaction修改数据
-%%%% @end
-%%%% ----------------------------------------------------
-%%transaction_after_update(TableKeyDefs, NValues) ->
-%%    sync_command("MULTL", []),
-%%    lists:foreach(fun({{T, K, _D}, NV}) ->
-%%        if
-%%            NV =:= 'ignore' ->
-%%                ok;
-%%            true ->
-%%                sync_command("SET", [redis_str_key(T, K), NV])
-%%        end
-%%    end, lists:zip(TableKeyDefs, NValues)),
-%%    sync_command("EXEC", []).
+%% ----------------------------------------------------
+%% @doc
+%%      transaction批量锁  自旋锁
+%% @end
+%% ----------------------------------------------------
+transaction_locks(TableKeys, TimeOut, V) ->
+    MS1 = now_millisecond(),
+    {Suc, Fail} = lists:foldl(fun(LockKey, {S, F}) ->
+        case sync_command(eredis_pool:get_pool(LockKey), "SET", [LockKey, V, "EX", ?LOCKTIME, "NX"]) of
+            {ok, <<"OK">>} ->
+                {[LockKey | S], F};
+            _ ->
+                {S, [LockKey | F]}
+        end
+    end, {[], []}, TableKeys),
+    case Fail =:= [] of
+        true ->
+            Suc;
+        false ->
+            unlock(Suc),
+            MS2 = now_millisecond(),
+            transaction_locks(TableKeys, TimeOut - (MS2 - MS1), V)
+    end.
+%% ----------------------------------------------------
+%% @doc
+%%      transaction 提交
+%% @end
+%% ----------------------------------------------------
+confirm([],[],[])->
+    ok;
+confirm([{T, K, _D} | TableKeyDefs], [OldV | Values], [NewV | NValues]) ->
+    case NewV of
+        ?IGNORE_VALUE ->
+            confirm(TableKeyDefs, Values, NValues);
+        OldV ->
+            confirm(TableKeyDefs, Values, NValues);
+        _ ->
+            case dirty_write({T, K}, NewV) of
+                {ok, _} ->
+                    ok;
+                {error, ER} ->
+                    lager:error("transaction_after_update_dirty_write_error:~p", [ER])
+            end,
+            confirm(TableKeyDefs, Values, NValues)
+    end.
+%% ----------------------------------------------------
+%% @doc
+%%       批量解除锁
+%% @end
+%% ----------------------------------------------------
+unlocks([]) ->
+    ok;
+unlocks([{_Table, _Key} | _T] = TableKeys) ->
+    LockKeys = redis_lock_key(TableKeys),
+    unlocks(LockKeys);
+unlocks([H | LockKeys]) ->
+    unlock(H),
+    unlocks(LockKeys).
 
 
+%% ----------------------------------------------------
+%% @doc
+%%       获得时间-毫秒
+%% @end
+%% ----------------------------------------------------
 now_millisecond() ->
     {M, S, MS} = os:timestamp(),
     M * 1000000000 + S * 1000 + MS div 1000.
 
+%% ----------------------------------------------------
+%% @doc
+%%       转字符串
+%% @end
+%% ----------------------------------------------------
+term_to_list(Term) when is_list(Term) ->
+    Term;
+term_to_list(Term) when is_integer(Term) ->
+    integer_to_list(Term);
+term_to_list(Term) when is_atom(Term) ->
+    atom_to_list(Term);
+term_to_list(_Term) ->
+    throw("undifined_type").
 
+
+%% ----------------------------------------------------
+%% @doc
+%%       合并返回值还有索引
+%% @end
+%% ----------------------------------------------------
+merge_index_value_def([], [], ReplyL) ->
+    ReplyL;
+merge_index_value_def([V | VL], [{I, DV} | IndexDefs], ReplyL) ->
+    R = if
+        DV =:= 'ignore' ->
+            {I, V};
+        V =:= undefined ->
+            {I, DV};
+        true ->
+            {I, V}
+    end,
+    merge_index_value_def(VL, IndexDefs, [R | ReplyL]).

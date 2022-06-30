@@ -23,7 +23,7 @@ Erlang Redis 驱动</br>
 mode 工作模式 
 * cluster cluster集群模式
 * single  单机模式
-* single_balance  
+
 
 
 ### Build

@@ -16,7 +16,6 @@
 -define(SERVER, ?MODULE).
 %%工作模式
 -define(SINGLE, single).
--define(SINGLE_BALANCE, single_balance).
 -define(CLUSTER, cluster).
 %%====================================================================
 %% API functions
@@ -45,9 +44,6 @@ init([]) ->
             Monitor = {eredis_monitor, {eredis_monitor, start_link, [{Pools, DockerMapping}]},
                 permanent, 5000, worker, [eredis_monitor]},
             [Pool, Monitor];
-        ?SINGLE_BALANCE ->
-            [{eredis_pool, {eredis_pool, start_balance, [Pools]},
-                permanent, 5000, worker, [eredis_pool]}];
         _ ->
             [{eredis_pool, {eredis_pool, start_single, [Pools]},
                 permanent, 5000, worker, [eredis_pool]}]

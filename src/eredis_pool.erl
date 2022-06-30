@@ -4,7 +4,7 @@
 -behaviour(supervisor).
 
 %% API
--export([start_single/1, start_cluster/0, start_balance/1]).
+-export([start_single/1, start_cluster/0]).
 -export([start_link/1]).
 -export([get_pool_name/1, start_child/1, delete_child/1]).
 -export([get_pool/1, get_mode_info/0]).
@@ -28,11 +28,8 @@ get_pool(Key) ->
     case get_mode_info() of
         [{_, 'single', PoolName}] ->
             PoolName;
-        [{_, 'single_balance', PoolNum, Pools}] ->
-            Index = erlang:phash(Key, PoolNum),
-            lists:nth(Index, Pools);
         [{_, 'cluster'}] ->
-            Slot = eredis_slot:slot(Key),
+            Slot = eredis_slot:slot_nif(Key),
             eredis_monitor:get_pool_by_slot(Slot)
     end.
 %%--------------------------------------------------------------------
@@ -66,8 +63,6 @@ q(PoolName, Command, Timeout) ->
         case gen_server:call(Worker, worker) of
             {ok, Pid} ->
                 case eredis:q(Pid, Command, Timeout) of
-                    {ok, Info} ->
-                        Info;
                     {error, Error} ->
                         case catch binary:split(Error, <<" ">>) of
                             [<<"MOVED">>, _Slot, IPPORT] ->%%集群发生变动，客户端slots映射还未维护
@@ -75,7 +70,9 @@ q(PoolName, Command, Timeout) ->
                                 q(eredis_monitor:get_pool_by_ipport(binary_to_list(IP1), binary_to_integer(Port1)), Command, Timeout);
                             _ ->%%TODO ASK 指令
                                 {error, Error}
-                        end
+                        end;
+                    R ->
+                        R
                 end;
             Error ->
                 Error
@@ -124,17 +121,6 @@ start_single({SizeArgs, WorkerArgs, Nodes}) ->
     PoolArgs = [{name, {local, PoolName}},
         {worker_module, eredis_conn}] ++ SizeArgs,
     start_link([poolboy:child_spec(PoolName, PoolArgs, [hd(Nodes) | WorkerArgs])]).
-start_balance({SizeArgs, WorkerArgs, Nodes}) ->
-    Num = length(Nodes),
-    ChildSpecs = lists:map(fun(Index) ->
-        PoolName = get_pool_name(Index),
-        PoolArgs = [{name, {local, PoolName}},
-            {worker_module, eredis_conn}] ++ SizeArgs,
-        poolboy:child_spec(PoolName, PoolArgs, [lists:nth(Index, Nodes) | WorkerArgs])
-    end, lists:seq(1, Num)),
-    Pools = [element(1, Child) || Child <- ChildSpecs],
-    set_mode_info({mode, single_balance, Num, Pools}),
-    start_link(ChildSpecs).
 start_cluster() ->
     set_mode_info({mode, cluster}),
     start_link([]).

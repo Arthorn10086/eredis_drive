@@ -5,7 +5,7 @@
 -author("arthorn").
 %%%=======================EXPORT=======================
 -export([slot/1]).
--export([load/0,slot_nif/1]).
+-export([slot_nif/1]).
 %%%=======================INCLUDE======================
 
 %%%=======================DEFINE======================
@@ -48,16 +48,15 @@
 %%        获取key对应slot
 %% @end
 %% ----------------------------------------------------
-slot(Key)->
+slot(Key) ->
     crc16(Key) rem ?REDIS_CLUSTER_HASH_SLOTS.
-load() ->
-    erlang:load_nif("E:/rust/erl_lib/target/release/erl_lib", 0).
-slot_nif(_Key)->
-    erlang:nif_error("NIF Library not loaded").
+
+slot_nif(Key) ->
+    crc_lib:crc16(Key) rem ?REDIS_CLUSTER_HASH_SLOTS.
 
 %% ----------------------------------------------------
 %% @doc
-%%       crc16校验码
+%%       crc16校验码 ccitt
 %% @end
 %% ----------------------------------------------------
 calcByte(Fcs, B) ->
